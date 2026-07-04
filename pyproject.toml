@@ -1,0 +1,41 @@
+[project]
+name = "caption-helper"
+version = "0.1.0"
+description = "Video to diarized subtitles and audio segments via FunASR"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles",
+    "fastapi",
+    "funasr",
+    "python-multipart",
+    "soundfile",
+    "torch",
+    "uvicorn[standard]",
+]
+
+[project.scripts]
+caption-helper = "caption_helper.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/caption_helper"]
+
+[project.optional-dependencies]
+tts = [
+    "transformers>=5.0",
+    "torchaudio",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
