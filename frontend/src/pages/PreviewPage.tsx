@@ -10,7 +10,7 @@ import {
   getRemuxWarnings,
   getSubtitles,
   outputVideoUrl,
-  startRemux,
+  rerunRemux,
   videoUrl,
 } from "../api";
 
@@ -113,7 +113,7 @@ export default function PreviewPage() {
     setMessage(null);
     setShowWarningDialog(false);
     try {
-      await startRemux(id);
+      await rerunRemux(id);
       setStatus("remuxing");
       setRemuxStage("assembling");
     } catch (e) {
@@ -174,7 +174,7 @@ export default function PreviewPage() {
           {syncMode === "natural-pace" ? "自然语速" : "固定槽位"}
         </span>
         <button onClick={() => runRemux()} disabled={remuxing}>
-          {remuxing ? "生成中…" : outputReady ? "重新生成输出" : "生成输出视频"}
+          {remuxing ? "生成中…" : outputReady ? "重新 remux" : "生成输出视频"}
         </button>
         <div className="toggle-group">
           <button

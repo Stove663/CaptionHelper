@@ -386,3 +386,135 @@ class TestWebApi:
         res = client.post(f"/api/projects/{meta.id}/remux")
         assert res.status_code == 400
         assert res.json()["detail"]["missing"] == [1]
+
+    def test_rerun_asr_clears_artifacts(self, client, monkeypatch) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        (project_dir / "source.mp4").write_bytes(b"video")
+        sentences = [Sentence("a", 0, 0, 1000)]
+        initialize_subtitle_files(project_dir, sentences)
+        (project_dir / "audio.wav").write_bytes(b"wav")
+        (project_dir / "segments" / "0001_spk0_0-1000.wav").write_bytes(b"x")
+        (project_dir / "output_video.mp4").write_bytes(b"mp4")
+        store.update_status(meta.id, "remux_ready")
+
+        async def fake_enqueue(project_id: str) -> None:
+            store.clear_downstream_artifacts(project_id, through="asr")
+            store.update_status(project_id, "uploaded", error=None)
+            store.update_status(project_id, "ready")
+
+        monkeypatch.setattr(client.app.state.jobs, "enqueue_asr_rerun", fake_enqueue)
+
+        res = client.post(f"/api/projects/{meta.id}/rerun/asr")
+        assert res.status_code == 202
+        assert res.json()["status"] == "extracting"
+        assert not (project_dir / "subtitles.json").is_file()
+        assert not (project_dir / "output_video.mp4").is_file()
+        assert (project_dir / "source.mp4").is_file()
+
+    def test_rerun_asr_missing_source(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        store.update_status(meta.id, "failed")
+        res = client.post(f"/api/projects/{meta.id}/rerun/asr")
+        assert res.status_code == 400
+
+    def test_rerun_asr_blocked_while_processing(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        (store.project_path(meta.id) / "source.mp4").write_bytes(b"v")
+        store.update_status(meta.id, "transcribing")
+        res = client.post(f"/api/projects/{meta.id}/rerun/asr")
+        assert res.status_code == 409
+
+    def test_rerun_references(self, client, monkeypatch) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        sentences = [Sentence("a", 0, 0, 1000)]
+        initialize_subtitle_files(project_dir, sentences)
+        (project_dir / "segments" / "0001_spk0_0-1000.wav").write_bytes(b"x")
+        store.update_status(meta.id, "ready")
+
+        async def fake_enqueue(project_id: str) -> None:
+            store.update_status(project_id, "ready")
+
+        monkeypatch.setattr(client.app.state.jobs, "enqueue_references", fake_enqueue)
+
+        res = client.post(f"/api/projects/{meta.id}/rerun/references")
+        assert res.status_code == 202
+        assert res.json()["status"] == "building_references"
+
+    def test_rerun_references_missing_segments(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        sentences = [Sentence("a", 0, 0, 1000)]
+        initialize_subtitle_files(project_dir, sentences)
+        store.update_status(meta.id, "ready")
+        res = client.post(f"/api/projects/{meta.id}/rerun/references")
+        assert res.status_code == 400
+
+    def test_rerun_synthesis_delegates(self, client, monkeypatch) -> None:
+        gpu = GPUInfo(available=True, name="Tesla T4", total_vram_gb=16.0, cuda_version="12.8")
+        monkeypatch.setattr(
+            "caption_helper.web.routes.projects.check_tts_compatibility",
+            lambda model_id, provider="moss-tts": PreflightResult(ok=True, message="OK", gpu=gpu),
+        )
+        monkeypatch.setattr(
+            "caption_helper.web.routes.projects.build_reference_quality_report",
+            lambda project_dir, **kw: {"unavailable": [], "cues": [], "speakers": {}},
+        )
+
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        sentences = [Sentence("a", 0, 0, 1000)]
+        initialize_subtitle_files(project_dir, sentences)
+        (project_dir / "segments" / "0001_spk0_0-1000.wav").write_bytes(b"x")
+        store.update_status(meta.id, "ready")
+        cues = load_subtitles(project_dir / "subtitles.json")
+        cues[0].text_edited = "changed"
+        client.put(
+            f"/api/projects/{meta.id}/subtitles",
+            json={"cues": [c.__dict__ for c in cues]},
+        )
+
+        async def fake_enqueue(project_id: str, *, skip_unavailable: bool = False) -> None:
+            store.update_status(project_id, "synthesizing")
+
+        monkeypatch.setattr(client.app.state.jobs, "enqueue_synthesis", fake_enqueue)
+
+        res = client.post(
+            f"/api/projects/{meta.id}/rerun/synthesis",
+            json={"skip_unavailable": False},
+        )
+        assert res.status_code == 202
+        assert res.json()["status"] == "synthesizing"
+
+    def test_rerun_remux_delegates(self, client, monkeypatch) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        sentences = [Sentence("a", 0, 0, 1000)]
+        initialize_subtitle_files(project_dir, sentences)
+        write_test_wav(project_dir / "audio.wav", duration_s=1.0)
+        store.update_status(meta.id, "ready")
+
+        async def fake_enqueue(project_id: str) -> None:
+            store.update_status(project_id, "remuxing")
+
+        monkeypatch.setattr(client.app.state.jobs, "enqueue_remux", fake_enqueue)
+
+        res = client.post(f"/api/projects/{meta.id}/rerun/remux")
+        assert res.status_code == 202
+        assert res.json()["status"] == "remuxing"
+
+    def test_rerun_blocked_during_synthesis(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        (store.project_path(meta.id) / "source.mp4").write_bytes(b"v")
+        store.update_status(meta.id, "synthesizing")
+        res = client.post(f"/api/projects/{meta.id}/rerun/asr")
+        assert res.status_code == 409
