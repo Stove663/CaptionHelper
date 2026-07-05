@@ -10,6 +10,7 @@ from caption_helper.tts.preflight import (
     check_tts_compatibility,
     get_gpu_info,
     log_gpu_info,
+    resolve_tokens_per_second,
     resolve_tts_model,
 )
 from caption_helper.tts.synthesizer import SynthesisResult, synthesize_modified_segments
@@ -31,6 +32,7 @@ __all__ = [
     "log_gpu_info",
     "max_new_tokens_for_slot",
     "ms_to_tokens",
+    "resolve_tokens_per_second",
     "resolve_tts_model",
     "synthesize_modified_segments",
     "wav_duration_ms",

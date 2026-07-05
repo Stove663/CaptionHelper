@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+from caption_helper.web.domain import ProjectStatus
+from caption_helper.web.state import ASR_ACTIVE_STATUSES
+
 if TYPE_CHECKING:
     from caption_helper.web.jobs import JobRunner
     from caption_helper.web.store import ProjectStore
 
 RerunStage = Literal["asr", "references", "synthesis", "remux"]
 
-ASR_ACTIVE_STATUSES = frozenset({"extracting", "transcribing", "splitting"})
-REFERENCES_ACTIVE_STATUS = "building_references"
+REFERENCES_ACTIVE_STATUS = ProjectStatus.BUILDING_REFERENCES.value
 
 
 class RerunConflictError(Exception):
@@ -27,13 +29,13 @@ def is_references_busy(status: str) -> bool:
 
 
 def is_synthesis_busy(status: str, jobs: JobRunner, project_id: str) -> bool:
-    if status == "synthesizing":
+    if status == ProjectStatus.SYNTHESIZING.value:
         return True
-    return jobs.get_synthesis_progress(project_id).status == "synthesizing"
+    return jobs.get_synthesis_progress(project_id).status == ProjectStatus.SYNTHESIZING.value
 
 
 def is_remux_busy(status: str) -> bool:
-    return status == "remuxing"
+    return status == ProjectStatus.REMUXING.value
 
 
 def check_rerun_allowed(

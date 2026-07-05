@@ -4,7 +4,9 @@ import logging
 import sys
 from pathlib import Path
 
+from caption_helper.asr_preflight import check_asr_compatibility
 from caption_helper.extract import FFmpegNotFoundError
+from caption_helper.network.mirrors import apply_china_mirror_defaults
 from caption_helper.pipeline import process
 
 
@@ -73,9 +75,9 @@ def _add_web_parser(subparsers: argparse._SubParsersAction) -> None:
     web_parser.add_argument("--hub", default=None, help='Model hub ("hf" or omit)')
     web_parser.add_argument(
         "--tts-model",
-        default="local-1.7b",
+        default="local-v1.5-4b",
         choices=["local-1.7b", "local-v1.5-4b"],
-        help="TTS model preset (default: local-1.7b = MOSS-TTS-Local-Transformer 1.7B)",
+        help="TTS model preset (default: local-v1.5-4b = MOSS-TTS-Local-Transformer-v1.5 4B)",
     )
     web_parser.add_argument(
         "--tts-device",
@@ -85,8 +87,8 @@ def _add_web_parser(subparsers: argparse._SubParsersAction) -> None:
     web_parser.add_argument(
         "--tokens-per-second",
         type=float,
-        default=25.0,
-        help="MOSS-TTS tokens per second for duration mapping (default: 25)",
+        default=None,
+        help="MOSS-TTS tokens per second for duration mapping (default: model preset, 12.5 for 4B / 25 for 1.7B)",
     )
     web_parser.add_argument(
         "--min-ref-duration-ms",
@@ -158,7 +160,12 @@ def _run_web(args: argparse.Namespace) -> int:
 
     from caption_helper.web.app import create_app
 
-    app = create_app(args.data_dir, args.frontend_dist, tts_model=args.tts_model)
+    app = create_app(
+        args.data_dir,
+        args.frontend_dist,
+        tts_model=args.tts_model,
+        tts_device=args.tts_device,
+    )
     app.state.jobs.set_pipeline_options(
         device=args.device,
         language=args.language,
@@ -178,6 +185,7 @@ def _run_web(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    apply_china_mirror_defaults()
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -188,6 +196,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "process":
+        preflight = check_asr_compatibility(hub=args.hub)
+        if not preflight.ok:
+            print(f"Error: {preflight.message}", file=sys.stderr)
+            return 1
         try:
             output = process(
                 args.video,

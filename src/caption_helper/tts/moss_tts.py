@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from caption_helper.tts.audio import PIPELINE_SAMPLE_RATE
 from caption_helper.tts.code_mix import detect_language_mode
-from caption_helper.tts.preflight import DEFAULT_MODEL
+from caption_helper.tts.preflight import DEFAULT_MODEL, resolve_tokens_per_second
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,9 @@ logger = logging.getLogger(__name__)
 class MossTTSConfig:
     model: str = DEFAULT_MODEL
     device: str | None = None
-    tokens_per_second: float = 25.0
+    tokens_per_second: float = field(
+        default_factory=lambda: resolve_tokens_per_second(DEFAULT_MODEL)
+    )
     language: str = "Chinese"
 
 
@@ -24,8 +27,23 @@ def max_new_tokens_for_slot(tokens: int) -> int:
     return min(4096, max(256, int(tokens) * 4))
 
 
+def _normalize_audio(audio: Any, sample_rate: int) -> tuple[Any, int]:
+    """Downmix to mono and resample to pipeline rate."""
+    import torch
+    import torchaudio
+
+    audio = audio.detach().cpu().to(torch.float32)
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    if sample_rate != PIPELINE_SAMPLE_RATE:
+        audio = torchaudio.transforms.Resample(sample_rate, PIPELINE_SAMPLE_RATE)(audio)
+    return audio, PIPELINE_SAMPLE_RATE
+
+
 class MossTTSEngine:
-    """Lazy-loaded MOSS-TTS voice cloning engine (Local-Transformer 1.7B default)."""
+    """Lazy-loaded MOSS-TTS voice cloning engine (Local-Transformer-v1.5 4B default)."""
 
     def __init__(self, config: MossTTSConfig | None = None) -> None:
         self.config = config or MossTTSConfig()
@@ -40,6 +58,14 @@ class MossTTSEngine:
         import torch
 
         return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    def _cuda_device_index(self) -> int | None:
+        device = self._resolve_device()
+        if device.startswith("cuda:"):
+            return int(device.split(":", 1)[1])
+        if device == "cuda":
+            return 0
+        return None
 
     def _configure_cuda_backends(self) -> None:
         import torch
@@ -81,7 +107,12 @@ class MossTTSEngine:
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            index = self._cuda_device_index()
+            if index is not None:
+                with torch.cuda.device(index):
+                    torch.cuda.empty_cache()
+            else:
+                torch.cuda.empty_cache()
             self._update_peak_vram()
 
     def reset_vram_stats(self) -> None:
@@ -89,14 +120,25 @@ class MossTTSEngine:
 
         self.peak_vram_mb = 0
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+            index = self._cuda_device_index()
+            if index is not None:
+                with torch.cuda.device(index):
+                    torch.cuda.reset_peak_memory_stats()
+            else:
+                torch.cuda.reset_peak_memory_stats()
 
     def _update_peak_vram(self) -> None:
         import torch
 
-        if torch.cuda.is_available():
+        if not torch.cuda.is_available():
+            return
+        index = self._cuda_device_index()
+        if index is not None:
+            with torch.cuda.device(index):
+                peak = torch.cuda.max_memory_allocated() // (1024 * 1024)
+        else:
             peak = torch.cuda.max_memory_allocated() // (1024 * 1024)
-            self.peak_vram_mb = max(self.peak_vram_mb, peak)
+        self.peak_vram_mb = max(self.peak_vram_mb, peak)
 
     def synthesize(
         self,
@@ -148,13 +190,9 @@ class MossTTSEngine:
             if not messages:
                 raise RuntimeError("MOSS-TTS returned no audio")
             audio = messages[0].audio_codes_list[0]
-            if audio.ndim == 1:
-                audio = audio.unsqueeze(0)
-            torchaudio.save(
-                str(output_path),
-                audio.detach().cpu().to(torch.float32),
-                self._processor.model_config.sampling_rate,
-            )
+            sample_rate = self._processor.model_config.sampling_rate
+            audio, sample_rate = _normalize_audio(audio, sample_rate)
+            torchaudio.save(str(output_path), audio, sample_rate)
 
         self._update_peak_vram()
         return output_path

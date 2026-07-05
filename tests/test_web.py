@@ -15,6 +15,7 @@ from caption_helper.subtitles_json import (
     validate_save_request,
 )
 from caption_helper.web.app import create_app
+from caption_helper.web.lifecycle import purge_expired_projects
 from caption_helper.web.store import ProjectStore
 from caption_helper.tts.preflight import GPUInfo, MODEL_V15_8B, PreflightResult
 from tests.helpers import write_test_wav
@@ -119,7 +120,7 @@ class TestWebApi:
         gpu = GPUInfo(available=True, name="Tesla T4", total_vram_gb=16.0, cuda_version="12.8")
         monkeypatch.setattr(
             "caption_helper.web.routes.projects.check_tts_compatibility",
-            lambda model_id, provider="moss-tts": __import__(
+            lambda model_id, provider="moss-tts", device=None: __import__(
                 "caption_helper.tts.preflight", fromlist=["PreflightResult"]
             ).PreflightResult(ok=True, message="OK", gpu=gpu),
         )
@@ -198,11 +199,11 @@ class TestWebApi:
         )
         monkeypatch.setattr(
             "caption_helper.web.jobs.check_tts_compatibility",
-            lambda model_id, provider="moss-tts": PreflightResult(ok=True, message="OK", gpu=gpu),
+            lambda model_id, provider="moss-tts", device=None: PreflightResult(ok=True, message="OK", gpu=gpu),
         )
         monkeypatch.setattr(
             "caption_helper.web.jobs.log_gpu_info",
-            lambda model_id: PreflightResult(ok=True, message="OK", gpu=gpu),
+            lambda model_id, device=None: PreflightResult(ok=True, message="OK", gpu=gpu),
         )
 
         res = client.post(
@@ -242,9 +243,9 @@ class TestWebApi:
         gpu = GPUInfo(available=True, name="Tesla T4", total_vram_gb=16.0, cuda_version="12.8")
         monkeypatch.setattr(
             "caption_helper.web.routes.projects.check_tts_compatibility",
-            lambda model_id, provider="moss-tts": PreflightResult(
+            lambda model_id, provider="moss-tts", device=None: PreflightResult(
                 ok=False,
-                message="Use local-1.7b",
+                message="Use local-v1.5-4b",
                 gpu=gpu,
             ),
         )
@@ -254,7 +255,7 @@ class TestWebApi:
             json={"skip_unavailable": False},
         )
         assert res.status_code == 400
-        assert "local-1.7b" in res.json()["detail"]
+        assert "local-v1.5-4b" in res.json()["detail"]
 
     def test_tts_provider_default(self, client) -> None:
         store: ProjectStore = client.app.state.store
@@ -295,6 +296,19 @@ class TestWebApi:
         project = client.get(f"/api/projects/{meta.id}").json()
         assert project["tts_provider"] == "moss-tts"
 
+    def test_legacy_meta_with_asr_provider_loads(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        meta_path = store.project_path(meta.id) / "meta.json"
+        import json
+
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data["asr_provider"] = "moss-audio"
+        meta_path.write_text(json.dumps(data), encoding="utf-8")
+        project = client.get(f"/api/projects/{meta.id}").json()
+        assert "asr_provider" not in project
+        assert project["filename"] == "x.mp4"
+
     def test_synthesize_blocks_glm_when_not_installed(self, client, monkeypatch) -> None:
         store: ProjectStore = client.app.state.store
         meta = store.create_project("x.mp4")
@@ -319,7 +333,7 @@ class TestWebApi:
         )
         monkeypatch.setattr(
             "caption_helper.web.routes.projects.check_tts_compatibility",
-            lambda model_id, provider="moss-tts": PreflightResult(
+            lambda model_id, provider="moss-tts", device=None: PreflightResult(
                 ok=False,
                 message="GLM-TTS is not installed",
                 gpu=gpu,
@@ -460,7 +474,7 @@ class TestWebApi:
         gpu = GPUInfo(available=True, name="Tesla T4", total_vram_gb=16.0, cuda_version="12.8")
         monkeypatch.setattr(
             "caption_helper.web.routes.projects.check_tts_compatibility",
-            lambda model_id, provider="moss-tts": PreflightResult(ok=True, message="OK", gpu=gpu),
+            lambda model_id, provider="moss-tts", device=None: PreflightResult(ok=True, message="OK", gpu=gpu),
         )
         monkeypatch.setattr(
             "caption_helper.web.routes.projects.build_reference_quality_report",
@@ -518,3 +532,65 @@ class TestWebApi:
         store.update_status(meta.id, "synthesizing")
         res = client.post(f"/api/projects/{meta.id}/rerun/asr")
         assert res.status_code == 409
+
+    def test_delete_project(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        project_dir = store.project_path(meta.id)
+        (project_dir / "source.mp4").write_bytes(b"v")
+        store.update_status(meta.id, "ready")
+
+        res = client.delete(f"/api/projects/{meta.id}")
+        assert res.status_code == 204
+        assert not project_dir.exists()
+
+        listed = client.get("/api/projects").json()
+        assert not any(p["id"] == meta.id for p in listed)
+        assert client.get(f"/api/projects/{meta.id}").status_code == 404
+
+    def test_delete_unknown_project(self, client) -> None:
+        res = client.delete("/api/projects/does-not-exist")
+        assert res.status_code == 404
+
+    def test_delete_blocked_while_processing(self, client) -> None:
+        store: ProjectStore = client.app.state.store
+        meta = store.create_project("x.mp4")
+        store.update_status(meta.id, "transcribing")
+
+        res = client.delete(f"/api/projects/{meta.id}")
+        assert res.status_code == 409
+        assert store.project_path(meta.id).is_dir()
+
+    def test_purge_expired_projects(self, client) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        store: ProjectStore = client.app.state.store
+        jobs = client.app.state.jobs
+
+        old = store.create_project("old.mp4")
+        store.update_status(old.id, "ready")
+        old_meta_path = store.project_path(old.id) / "meta.json"
+        old_data = json.loads(old_meta_path.read_text(encoding="utf-8"))
+        old_data["created_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=8)
+        ).isoformat()
+        old_meta_path.write_text(json.dumps(old_data), encoding="utf-8")
+
+        recent = store.create_project("recent.mp4")
+        store.update_status(recent.id, "ready")
+
+        busy = store.create_project("busy.mp4")
+        store.update_status(busy.id, "transcribing")
+        busy_meta_path = store.project_path(busy.id) / "meta.json"
+        busy_data = json.loads(busy_meta_path.read_text(encoding="utf-8"))
+        busy_data["created_at"] = (
+            datetime.now(timezone.utc) - timedelta(days=8)
+        ).isoformat()
+        busy_meta_path.write_text(json.dumps(busy_data), encoding="utf-8")
+
+        deleted = purge_expired_projects(store, jobs)
+        assert old.id in deleted
+        assert not (store.projects_dir / old.id).exists()
+        assert (store.projects_dir / recent.id).exists()
+        assert (store.projects_dir / busy.id).exists()
+

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from caption_helper.models import Sentence
 
@@ -23,6 +23,10 @@ class TranscriberConfig:
     model: str = DEFAULT_MODEL
     vad_model: str = DEFAULT_VAD_MODEL
     spk_model: str = DEFAULT_SPK_MODEL
+
+
+class BaseTranscriber(Protocol):
+    def transcribe(self, audio_path: str) -> list[Sentence]: ...
 
 
 def resolve_device(device: str | None) -> str:
@@ -54,7 +58,7 @@ def sentences_from_sentence_info(sentence_info: list[dict[str, Any]]) -> list[Se
     return sentences
 
 
-class Transcriber:
+class FunASRTranscriber:
     """FunASR wrapper for Fun-ASR-Nano + VAD + speaker diarization."""
 
     def __init__(self, config: TranscriberConfig | None = None) -> None:
@@ -95,3 +99,10 @@ class Transcriber:
             return []
         sentence_info = result[0].get("sentence_info") or []
         return sentences_from_sentence_info(sentence_info)
+
+
+Transcriber = FunASRTranscriber
+
+
+def get_transcriber(config: TranscriberConfig | None = None) -> BaseTranscriber:
+    return FunASRTranscriber(config)

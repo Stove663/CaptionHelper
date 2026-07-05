@@ -13,7 +13,7 @@ from caption_helper.tts.compression_risk import SYNC_MODE_FIXED, SYNC_MODE_NATUR
 from caption_helper.tts.duration import fit_duration, ms_to_tokens, wav_duration_ms
 from caption_helper.tts.engine import TTSEngine
 from caption_helper.tts.moss_tts import MossTTSConfig, MossTTSEngine
-from caption_helper.tts.preflight import DEFAULT_MODEL, get_gpu_info
+from caption_helper.tts.preflight import DEFAULT_MODEL, get_gpu_info, resolve_tokens_per_second
 from caption_helper.tts.reference import (
     ReferenceConfig,
     ReferenceUnavailable,
@@ -33,12 +33,16 @@ class CueSynthesisRecord:
     reference_segment: str
     target_duration_ms: int
     tokens: int | None = None
+    tokens_per_second: float = 25.0
     sync_mode: str = SYNC_MODE_FIXED
     slot_duration_ms: int = 0
     actual_duration_ms: int | None = None
     delta_ms: int = 0
     code_mixed: bool = False
     language_mode: str = "Chinese"
+    phoneme_enabled: bool = False
+    text_prep_applied: bool = False
+    glm_phoneme_mode: str | None = None
     reference_source: str | None = None
     reference_path: str | None = None
     reference_fallback_reason: str | None = None
@@ -134,6 +138,7 @@ def synthesize_modified_segments(
     ref_config: ReferenceConfig | None = None,
     sync_mode: str = SYNC_MODE_FIXED,
     tts_provider: str = "moss-tts",
+    glm_phoneme_mode: str = "auto",
     on_progress: Callable[[int, int], None] | None = None,
     skip_unavailable: bool = False,
 ) -> SynthesisResult:
@@ -142,18 +147,27 @@ def synthesize_modified_segments(
     cfg = config or (engine.config if engine else MossTTSConfig())
     ref_cfg = ref_config or ReferenceConfig()
     tts_engine = engine or MossTTSEngine(cfg)
+    if hasattr(tts_engine, "config") and hasattr(tts_engine.config, "glm_phoneme_mode"):
+        tts_engine.config.glm_phoneme_mode = glm_phoneme_mode
     modified = _load_modified_segments(project_dir)
     tts_dir = project_dir / "tts_segments"
     tts_dir.mkdir(parents=True, exist_ok=True)
     natural_pace = sync_mode == SYNC_MODE_NATURAL
 
-    gpu = get_gpu_info()
+    gpu = get_gpu_info(cfg.device)
+    tokens_per_second = resolve_tokens_per_second(
+        cfg.model or DEFAULT_MODEL,
+        cfg.tokens_per_second,
+    )
+    gpu_label = gpu.name
+    if gpu.available and cfg.device:
+        gpu_label = f"{gpu.name} [{cfg.device}]"
     result = SynthesisResult(
         model=cfg.model or DEFAULT_MODEL,
         model_id=cfg.model or DEFAULT_MODEL,
         tts_provider=tts_provider,
         sync_mode=sync_mode,
-        gpu_name=gpu.name,
+        gpu_name=gpu_label,
         total=len(modified),
     )
     if not modified:
@@ -165,7 +179,9 @@ def synthesize_modified_segments(
     for idx, entry in enumerate(modified):
         cue = _entry_to_cue(entry)
         target_ms = cue.end_ms - cue.start_ms
-        tokens = None if natural_pace else ms_to_tokens(target_ms, tokens_per_second=cfg.tokens_per_second)
+        tokens = None if natural_pace else ms_to_tokens(
+            target_ms, tokens_per_second=tokens_per_second
+        )
         out_path = _output_path(project_dir, entry)
         text = cue.text_edited
         lang_mode = detect_language_mode(text)
@@ -176,6 +192,7 @@ def synthesize_modified_segments(
             reference_segment=str(entry.get("segment_path", "")),
             target_duration_ms=target_ms,
             tokens=tokens,
+            tokens_per_second=tokens_per_second,
             sync_mode=sync_mode,
             slot_duration_ms=target_ms,
             code_mixed=is_code_mixed(text),
@@ -202,6 +219,11 @@ def synthesize_modified_segments(
                 output_path=raw_path,
                 reference_text=reference_text,
             )
+            if getattr(tts_engine, "last_synthesis_detail", None) is not None:
+                detail = tts_engine.last_synthesis_detail
+                record.phoneme_enabled = detail.phoneme_enabled
+                record.text_prep_applied = detail.text_prep_applied
+                record.glm_phoneme_mode = detail.glm_phoneme_mode
             if natural_pace:
                 actual_ms = wav_duration_ms(raw_path)
                 record.actual_duration_ms = actual_ms

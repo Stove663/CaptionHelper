@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import {
   RerunAction,
   availableRerunActions,
+  deleteProject,
   downloadOutputVideo,
   isProjectProcessing,
   listProjects,
@@ -26,6 +27,7 @@ export default function HomePage() {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [rerunningId, setRerunningId] = useState<string | null>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
 
@@ -74,6 +76,24 @@ export default function HomePage() {
     }
   };
 
+  const onDelete = async (projectId: string) => {
+    const ok = window.confirm(
+      "将永久删除该任务及所有相关文件，无法恢复。是否继续？",
+    );
+    if (!ok) return;
+    setDeletingId(projectId);
+    setError(null);
+    setOpenMenuId(null);
+    try {
+      await deleteProject(projectId);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除失败");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   const onFile = async (file: File) => {
     setUploading(true);
     setError(null);
@@ -98,7 +118,7 @@ export default function HomePage() {
           if (file) onFile(file);
         }}
       >
-        <p>拖拽视频到此处，或选择文件上传</p>
+        <p>拖拽视频到此处，或选择文件上传（ASR：FunASR）</p>
         <input
           type="file"
           accept="video/*,.mp4,.mov,.mkv"
@@ -125,7 +145,7 @@ export default function HomePage() {
           {projects.map((p) => {
             const processing = isProjectProcessing(p.status);
             const rerunActions = availableRerunActions(p.status);
-            const busy = rerunningId === p.id || processing;
+            const busy = rerunningId === p.id || deletingId === p.id || processing;
             return (
               <tr key={p.id}>
                 <td>{p.filename}</td>
@@ -189,6 +209,14 @@ export default function HomePage() {
                       )}
                     </div>
                   )}
+                  <button
+                    type="button"
+                    className="link-button delete-button"
+                    disabled={busy}
+                    onClick={() => onDelete(p.id)}
+                  >
+                    {deletingId === p.id ? "删除中…" : "删除"}
+                  </button>
                 </td>
               </tr>
             );

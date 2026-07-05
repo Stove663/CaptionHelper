@@ -4,7 +4,9 @@ import {
   Cue,
   ReferenceCueReport,
   ReferenceQualityReport,
+  RerunAction,
   SynthesisManifestCue,
+  availableRerunActions,
   formatMs,
   getCompressionRisk,
   getModifiedSegments,
@@ -14,7 +16,11 @@ import {
   getSynthesisManifest,
   getSynthesisStatus,
   getTimeline,
+  isProjectProcessing,
   refStatusLabel,
+  rerunAsr,
+  rerunReferences,
+  rerunSynthesis,
   saveSubtitles,
   segmentFilename,
   segmentUrl,
@@ -25,6 +31,13 @@ import {
   ttsSegmentUrl,
   videoUrl,
 } from "../api";
+
+const RERUN_LABELS: Record<RerunAction, string> = {
+  asr: "重跑 ASR",
+  references: "重建参考音库",
+  synthesis: "重新合成",
+  remux: "重新 remux",
+};
 
 export default function EditorPage() {
   const { id = "" } = useParams();
@@ -46,7 +59,12 @@ export default function EditorPage() {
     null,
   );
   const [compressionRiskCount, setCompressionRiskCount] = useState(0);
+  const [codeMixedRecommendCount, setCodeMixedRecommendCount] = useState(0);
+  const [codeMixedModifiedCount, setCodeMixedModifiedCount] = useState(0);
+  const [providerGuidance, setProviderGuidance] = useState<string | null>(null);
   const [durationDeltaMs, setDurationDeltaMs] = useState<number | null>(null);
+  const [rerunning, setRerunning] = useState(false);
+  const prevStatusRef = useRef("loading");
 
   const editable =
     status === "ready" ||
@@ -91,14 +109,33 @@ export default function EditorPage() {
     try {
       const report = await getCompressionRisk(id);
       setCompressionRiskCount(report.at_risk_count);
+      setCodeMixedModifiedCount(report.code_mixed_modified_count);
+      setProviderGuidance(report.provider_guidance);
+      setCodeMixedRecommendCount(
+        report.cues.filter((c) => c.recommend_natural_pace).length,
+      );
     } catch {
       setCompressionRiskCount(0);
+      setCodeMixedRecommendCount(0);
+      setCodeMixedModifiedCount(0);
+      setProviderGuidance(null);
     }
   };
 
   const loadTimelinePreview = async () => {
     const timeline = await getTimeline(id);
     if (timeline) setDurationDeltaMs(timeline.duration_delta_ms);
+  };
+
+  const loadEditorData = async () => {
+    const data = await getSubtitles(id);
+    const modified = await getModifiedSegments(id);
+    setCues(data.cues);
+    setModifiedCount(modified.length);
+    await loadReferenceQuality();
+    await loadManifest();
+    await loadCompressionRisk();
+    await loadTimelinePreview();
   };
 
   useEffect(() => {
@@ -110,23 +147,42 @@ export default function EditorPage() {
         project.sync_mode === "natural-pace" ? "natural-pace" : "fixed-slot",
       );
       setTtsProviderState(project.tts_provider === "glm-tts" ? "glm-tts" : "moss-tts");
+      prevStatusRef.current = project.status;
       if (project.status === "ready" || project.status.startsWith("synthesis")) {
-        const data = await getSubtitles(id);
-        const modified = await getModifiedSegments(id);
-        if (!cancelled) {
-          setCues(data.cues);
-          setModifiedCount(modified.length);
+        if (cues.length === 0) {
+          await loadEditorData();
+        } else {
+          await loadReferenceQuality();
+          await loadManifest();
+          await loadCompressionRisk();
+          await loadTimelinePreview();
         }
-        await loadReferenceQuality();
-        await loadManifest();
-        await loadCompressionRisk();
-        await loadTimelinePreview();
       }
     };
     load();
     const timer = setInterval(async () => {
       const project = await getProject(id);
+      const prev = prevStatusRef.current;
       setStatus(project.status);
+      if (
+        prev !== project.status &&
+        project.status === "ready" &&
+        (prev === "building_references" ||
+          prev === "extracting" ||
+          prev === "transcribing" ||
+          prev === "splitting")
+      ) {
+        if (prev === "building_references") {
+          await loadReferenceQuality();
+          if (!cancelled) setMessage("参考音库已重建，请重新合成");
+        } else {
+          setManifestByCue({});
+          setLastSynthProvider(null);
+          await loadEditorData();
+          if (!cancelled) setMessage("ASR 已完成，字幕已更新");
+        }
+      }
+      prevStatusRef.current = project.status;
       if (
         (project.status === "ready" || project.status.startsWith("synthesis")) &&
         cues.length === 0
@@ -253,6 +309,36 @@ export default function EditorPage() {
     }
   };
 
+  const onRerun = async (action: RerunAction) => {
+    if (action === "asr") {
+      const ok = window.confirm(
+        "重跑 ASR 将删除所有字幕、编辑与下游合成结果，是否继续？",
+      );
+      if (!ok) return;
+    }
+    setRerunning(true);
+    setMessage(null);
+    try {
+      if (action === "asr") await rerunAsr(id);
+      else if (action === "references") await rerunReferences(id);
+      else await rerunSynthesis(id, { syncMode });
+      const project = await getProject(id);
+      setStatus(project.status);
+      prevStatusRef.current = project.status;
+      if (action === "synthesis") {
+        setSynthesizing(true);
+        setSynthProgress({ completed: 0, total: modifiedCount });
+      }
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : "重跑失败");
+    } finally {
+      setRerunning(false);
+    }
+  };
+
+  const rerunActions = availableRerunActions(status).filter((a) => a !== "remux");
+  const pipelineBusy = isProjectProcessing(status) || rerunning || synthesizing;
+
   if (!editable && status !== "synthesizing") {
     return (
       <div className="panel">
@@ -266,6 +352,7 @@ export default function EditorPage() {
     <div className="editor">
       <div className="editor-toolbar">
         <Link to="/">← 返回</Link>
+        <span className="muted">ASR: FunASR</span>
         <div className="toggle-group">
           <button
             type="button"
@@ -302,12 +389,26 @@ export default function EditorPage() {
             GLM-TTS
           </button>
         </div>
-        <button onClick={onSave} disabled={saving || synthesizing}>
+        <button onClick={onSave} disabled={saving || synthesizing || rerunning}>
           {saving ? "保存中…" : "保存"}
         </button>
+        {rerunActions.length > 0 && (
+          <div className="rerun-group">
+            {rerunActions.map((action) => (
+              <button
+                key={action}
+                type="button"
+                onClick={() => onRerun(action)}
+                disabled={pipelineBusy}
+              >
+                {rerunning ? "重跑中…" : RERUN_LABELS[action]}
+              </button>
+            ))}
+          </div>
+        )}
         <button
           onClick={() => runSynthesis(false)}
-          disabled={synthesizing || modifiedCount === 0 || unavailableCount > 0}
+          disabled={synthesizing || rerunning || modifiedCount === 0 || unavailableCount > 0}
           title={
             unavailableCount > 0
               ? `${unavailableCount} 个片段无可用参考音频`
@@ -355,10 +456,16 @@ export default function EditorPage() {
           <Link to={`/projects/${id}/preview`}>预览输出 →</Link>
         )}
       </div>
-      {compressionRiskCount > 0 && syncMode === "fixed-slot" && (
+      {syncMode === "fixed-slot" &&
+        (compressionRiskCount > 0 ||
+          (ttsProvider === "glm-tts" && codeMixedModifiedCount > 0)) && (
         <div className="compression-banner">
           <span>
-            {compressionRiskCount} 个片段在固定槽位模式下可能被压缩，建议切换为
+            {ttsProvider === "glm-tts" && providerGuidance
+              ? providerGuidance
+              : codeMixedRecommendCount > 0
+                ? `${codeMixedRecommendCount} 个中英混合片段在固定槽位下英文发音可能被压缩，强烈建议切换为`
+                : `${compressionRiskCount} 个片段在固定槽位模式下可能被压缩，建议切换为`}
           </span>
           <button type="button" onClick={() => onSyncModeChange("natural-pace")}>
             自然语速

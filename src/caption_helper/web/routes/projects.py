@@ -20,10 +20,14 @@ from caption_helper.subtitles_json import (
     validate_save_request,
     write_srt_from_cues,
 )
+from caption_helper.asr_preflight import check_asr_compatibility
 from caption_helper.tts.compression_risk import VALID_SYNC_MODES, compression_risks_at_risk
+from caption_helper.tts.glm_phoneme import count_code_mixed_modified, glm_provider_guidance
 from caption_helper.tts.preflight import check_tts_compatibility
 from caption_helper.tts.reference import build_reference_quality_report, save_reference_override
 from caption_helper.web.jobs import JobRunner
+from caption_helper.web.lifecycle import is_project_busy
+from caption_helper.web.rerun import RerunConflictError, check_rerun_allowed
 from caption_helper.web.store import ProjectStore
 
 router = APIRouter(prefix="/api/projects")
@@ -37,13 +41,85 @@ def _jobs(request: Request) -> JobRunner:
     return request.app.state.jobs
 
 
+def _rerun_conflict(exc: RerunConflictError) -> HTTPException:
+    return HTTPException(status_code=409, detail=exc.message)
+
+
+@router.post("/{project_id}/rerun/asr", status_code=202)
+async def rerun_asr(request: Request, project_id: str) -> dict[str, Any]:
+    store = _store(request)
+    jobs = _jobs(request)
+    try:
+        store.find_source_video(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail="No source video for project") from exc
+    try:
+        check_rerun_allowed(store, jobs, project_id, "asr")
+    except RerunConflictError as exc:
+        raise _rerun_conflict(exc) from exc
+    await jobs.enqueue_asr_rerun(project_id)
+    return {"status": "extracting"}
+
+
+@router.post("/{project_id}/rerun/references", status_code=202)
+async def rerun_references(request: Request, project_id: str) -> dict[str, Any]:
+    store = _store(request)
+    jobs = _jobs(request)
+    project_dir = _project_dir(request, project_id)
+    if not (project_dir / "subtitles.json").is_file():
+        raise HTTPException(status_code=400, detail="Subtitles not ready")
+    segments = list((project_dir / "segments").glob("*.wav"))
+    if not segments:
+        raise HTTPException(status_code=400, detail="No audio segments")
+    try:
+        check_rerun_allowed(store, jobs, project_id, "references")
+    except RerunConflictError as exc:
+        raise _rerun_conflict(exc) from exc
+    await jobs.enqueue_references(project_id)
+    return {"status": "building_references"}
+
+
+@router.post("/{project_id}/rerun/synthesis", status_code=202)
+async def rerun_synthesis(
+    request: Request,
+    project_id: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    store = _store(request)
+    jobs = _jobs(request)
+    try:
+        check_rerun_allowed(store, jobs, project_id, "synthesis")
+    except RerunConflictError as exc:
+        raise _rerun_conflict(exc) from exc
+    return await _start_synthesis(request, project_id, body)
+
+
+@router.post("/{project_id}/rerun/remux", status_code=202)
+async def rerun_remux(request: Request, project_id: str) -> dict[str, Any]:
+    store = _store(request)
+    jobs = _jobs(request)
+    try:
+        check_rerun_allowed(store, jobs, project_id, "remux")
+    except RerunConflictError as exc:
+        raise _rerun_conflict(exc) from exc
+    return await _start_remux(request, project_id)
+
+
 @router.post("", status_code=202)
-async def create_project(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
+async def create_project(
+    request: Request,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty upload")
+
+    hub = request.app.state.jobs._pipeline_options.get("hub")
+    preflight = check_asr_compatibility(hub=hub)
+    if not preflight.ok:
+        raise HTTPException(status_code=400, detail=preflight.message)
 
     store = _store(request)
     meta = store.create_project(file.filename)
@@ -63,6 +139,19 @@ def get_project(request: Request, project_id: str) -> dict[str, Any]:
         return _store(request).get_project(project_id).to_dict()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/{project_id}", status_code=204)
+def delete_project_route(request: Request, project_id: str) -> None:
+    store = _store(request)
+    jobs = _jobs(request)
+    try:
+        meta = store.get_project(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if is_project_busy(meta.status, jobs, project_id):
+        raise HTTPException(status_code=409, detail="Project is processing")
+    store.delete_project(project_id)
 
 
 @router.put("/{project_id}/sync-mode")
@@ -99,10 +188,18 @@ def compression_risk(request: Request, project_id: str) -> dict[str, Any]:
     json_path = project_dir / "subtitles.json"
     if not json_path.is_file():
         raise HTTPException(status_code=404, detail="Subtitles not ready")
+    meta = _store(request).get_project(project_id)
     cues = load_subtitles(json_path)
     risks = compression_risks_at_risk(cues)
+    code_mixed_modified_count = count_code_mixed_modified(cues)
     return {
         "at_risk_count": len(risks),
+        "code_mixed_modified_count": code_mixed_modified_count,
+        "provider_guidance": glm_provider_guidance(
+            tts_provider=meta.tts_provider,
+            sync_mode=meta.sync_mode,
+            code_mixed_modified_count=code_mixed_modified_count,
+        ),
         "cues": [asdict(r) for r in risks],
     }
 
@@ -203,6 +300,14 @@ async def start_synthesis(
     project_id: str,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    return await _start_synthesis(request, project_id, body)
+
+
+async def _start_synthesis(
+    request: Request,
+    project_id: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     project_dir = _project_dir(request, project_id)
     modified_path = project_dir / "modified_segments.json"
     if not modified_path.is_file():
@@ -217,7 +322,9 @@ async def start_synthesis(
     jobs = _jobs(request)
     provider = _store(request).get_project(project_id).tts_provider
     model_id = jobs.tts_model_id(provider=provider)
-    preflight = check_tts_compatibility(model_id, provider=provider)
+    preflight = check_tts_compatibility(
+        model_id, provider=provider, device=jobs.tts_device()
+    )
     if not preflight.ok:
         raise HTTPException(status_code=400, detail=preflight.message)
 
@@ -296,6 +403,10 @@ def get_tts_segment_audio(request: Request, project_id: str, filename: str) -> F
 
 @router.post("/{project_id}/remux", status_code=202)
 async def start_remux(request: Request, project_id: str) -> dict[str, Any]:
+    return await _start_remux(request, project_id)
+
+
+async def _start_remux(request: Request, project_id: str) -> dict[str, Any]:
     project_dir = _project_dir(request, project_id)
     if not (project_dir / "audio.wav").is_file():
         raise HTTPException(status_code=400, detail="Project audio not ready")

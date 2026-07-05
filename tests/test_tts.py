@@ -37,6 +37,8 @@ class TestDuration:
 
 class TestMossTTS:
     def test_synthesize_call_shape(self, tmp_path: Path) -> None:
+        import torch
+
         ref = tmp_path / "ref.wav"
         out = tmp_path / "out.wav"
         sf.write(str(ref), np.zeros(8000, dtype=np.float32), 16000)
@@ -48,7 +50,9 @@ class TestMossTTS:
             "input_ids": MagicMock(),
             "attention_mask": MagicMock(),
         }
-        mock_processor.decode.return_value = [MagicMock(audio_codes_list=[MagicMock(ndim=1)])]
+        mock_processor.decode.return_value = [
+            MagicMock(audio_codes_list=[torch.zeros(24000)])
+        ]
 
         mock_model = MagicMock()
         mock_model.generate.return_value = "outputs"
@@ -70,6 +74,31 @@ class TestMossTTS:
         assert kwargs["language"] == "Chinese"
         mock_processor.assert_called_once()
         mock_model.generate.assert_called_once()
+
+    def test_normalize_audio_stereo_48k_to_mono_16k(self) -> None:
+        import torch
+        from caption_helper.tts.moss_tts import _normalize_audio
+
+        stereo = torch.zeros(2, 48000)
+        mock_ta = MagicMock()
+
+        class _Resample:
+            def __init__(self, src: int, dst: int) -> None:
+                self._ratio = dst / src
+
+            def __call__(self, audio: torch.Tensor) -> torch.Tensor:
+                out_len = max(1, int(audio.shape[-1] * self._ratio))
+                return audio[:, :out_len]
+
+        mock_ta.transforms.Resample = _Resample
+
+        with patch.dict(sys.modules, {"torchaudio": mock_ta}):
+            audio, sample_rate = _normalize_audio(stereo, 48000)
+
+        assert sample_rate == 16000
+        assert audio.shape[0] == 1
+        assert audio.shape[1] == 16000
+
 
     def test_build_message_kwargs_code_mixed(self) -> None:
         from caption_helper.tts.code_mix import detect_language_mode
@@ -141,7 +170,8 @@ class TestSynthesizer:
 
         manifest = json.loads((tmp_path / "synthesis_manifest.json").read_text(encoding="utf-8"))
         assert manifest["completed"] == 1
-        assert manifest["cues"][0]["tokens"] == 25
+        assert manifest["cues"][0]["tokens"] == 12
+        assert manifest["cues"][0]["tokens_per_second"] == 12.5
         assert manifest["cues"][0]["reference_segment"] == "segments/0002_spk1_1000-2000.wav"
 
     def test_natural_pace_skips_trim(self, tmp_path: Path) -> None:

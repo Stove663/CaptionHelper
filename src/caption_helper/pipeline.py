@@ -4,7 +4,7 @@ from pathlib import Path
 from caption_helper.extract import extract_audio
 from caption_helper.split import split_segments
 from caption_helper.srt import write_srt
-from caption_helper.transcribe import Transcriber, TranscriberConfig
+from caption_helper.transcribe import TranscriberConfig, get_transcriber
 from caption_helper.tts.reference import build_speaker_reference_bank
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,8 @@ def process(
     logger.info("Extracting audio from %s", video_path.name)
     extract_audio(video_path, audio_wav)
 
-    logger.info("Transcribing audio (FunASR)")
-    transcriber = Transcriber(
+    logger.info("Transcribing audio with FunASR")
+    transcriber = get_transcriber(
         TranscriberConfig(
             device=device,
             language=language,

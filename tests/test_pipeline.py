@@ -24,13 +24,13 @@ class TestPipelineIntegration:
     )
 
     class FakeTranscriber:
-      def __init__(self, config=None):
-        pass
-
       def transcribe(self, audio_path):
         return sentences
 
-    monkeypatch.setattr("caption_helper.pipeline.Transcriber", FakeTranscriber)
+    monkeypatch.setattr(
+      "caption_helper.pipeline.get_transcriber",
+      lambda config=None: FakeTranscriber(),
+    )
 
     def fake_split(full_wav, sents, segments_dir):
       paths = []

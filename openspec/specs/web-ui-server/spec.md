@@ -33,11 +33,11 @@ The system SHALL accept video file uploads through the browser and create a new 
 
 ### Requirement: Background ASR job execution
 
-The system SHALL run the existing caption pipeline (extract → transcribe → SRT → split) as a background job per uploaded project without blocking the HTTP server.
+The system SHALL run the caption pipeline (extract → transcribe → SRT → split) as a background job per uploaded project without blocking the HTTP server, using FunASR for the transcription step.
 
-#### Scenario: Job progress reporting
+#### Scenario: Background processing status flow
 
-- **WHEN** a project is processing
+- **WHEN** a video upload completes
 - **THEN** the project status progresses through `uploaded`, `extracting`, `transcribing`, `splitting`, and `ready`
 
 #### Scenario: Job failure
@@ -128,4 +128,32 @@ The system SHALL execute rerun jobs in the background using the same job runner 
 
 - **WHEN** a reference bank rerun job runs
 - **THEN** project status is set to `building_references` during execution and `ready` on success, or `failed` with an error message on failure
+
+### Requirement: Project deletion API
+
+The system SHALL expose `DELETE /api/projects/{id}` to permanently remove a project and all on-disk artifacts.
+
+#### Scenario: Delete returns no content
+
+- **WHEN** the client calls `DELETE /api/projects/{id}` for an existing, non-processing project
+- **THEN** the server responds with HTTP 204 and removes the project directory
+
+#### Scenario: Delete unknown project
+
+- **WHEN** the client calls `DELETE /api/projects/{id}` for a non-existent project ID
+- **THEN** the server responds with HTTP 404
+
+#### Scenario: Delete busy project
+
+- **WHEN** the client calls `DELETE /api/projects/{id}` while the project has an in-progress job
+- **THEN** the server responds with HTTP 409
+
+### Requirement: Project list excludes deleted projects
+
+The system SHALL only include projects whose directories exist on disk in `GET /api/projects` responses.
+
+#### Scenario: List after deletion
+
+- **WHEN** a project is deleted manually or by expiration cleanup
+- **THEN** subsequent `GET /api/projects` responses do not include that project
 

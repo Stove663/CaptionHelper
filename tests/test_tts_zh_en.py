@@ -13,6 +13,7 @@ from caption_helper.tts.preflight import (
     GPUInfo,
     check_tts_compatibility,
     is_8b_model,
+    resolve_tokens_per_second,
     resolve_tts_model,
 )
 
@@ -37,6 +38,17 @@ class TestCodeMix:
         assert detect_language_mode(text) == "Chinese"
 
 
+class TestTokensPerSecond:
+    def test_4b_preset(self) -> None:
+        assert resolve_tokens_per_second(MODEL_LOCAL_V15_4B) == 12.5
+
+    def test_1_7b_preset(self) -> None:
+        assert resolve_tokens_per_second(MODEL_LOCAL_1_7B) == 25.0
+
+    def test_cli_override(self) -> None:
+        assert resolve_tokens_per_second(MODEL_LOCAL_V15_4B, 20.0) == 20.0
+
+
 class TestPreflight:
     def test_resolve_presets(self) -> None:
         assert resolve_tts_model("local-1.7b") == MODEL_LOCAL_1_7B
@@ -51,7 +63,19 @@ class TestPreflight:
         with patch("caption_helper.tts.preflight.get_gpu_info", return_value=gpu):
             result = check_tts_compatibility(MODEL_V15_8B)
         assert result.ok is False
-        assert "local-1.7b" in result.message
+        assert "local-v1.5-4b" in result.message
+
+    def test_allows_4b_on_t4(self) -> None:
+        gpu = GPUInfo(
+            available=True,
+            name="Tesla T4",
+            total_vram_gb=16.0,
+            cuda_version="12.8",
+            device_index=0,
+        )
+        with patch("caption_helper.tts.preflight.get_gpu_info", return_value=gpu):
+            result = check_tts_compatibility(MODEL_LOCAL_V15_4B)
+        assert result.ok is True
 
     def test_allows_1_7b_on_t4(self) -> None:
         gpu = GPUInfo(available=True, name="Tesla T4", total_vram_gb=16.0, cuda_version="12.8")
@@ -64,6 +88,37 @@ class TestPreflight:
         with patch("caption_helper.tts.preflight.get_gpu_info", return_value=gpu):
             result = check_tts_compatibility(MODEL_LOCAL_V15_4B)
         assert result.ok is False
+
+    def test_blocks_4b_on_secondary_gpu_with_low_vram(self) -> None:
+        gpu_low = GPUInfo(
+            available=True,
+            name="GTX 1070",
+            total_vram_gb=8.0,
+            cuda_version="12.1",
+            device_index=1,
+        )
+        with patch("caption_helper.tts.preflight.get_gpu_info", return_value=gpu_low):
+            result = check_tts_compatibility(MODEL_LOCAL_V15_4B, device="cuda:1")
+        assert result.ok is False
+        assert "cuda:1" in result.message
+
+    def test_checks_configured_device(self) -> None:
+        gpu_1 = GPUInfo(
+            available=True,
+            name="Tesla T4",
+            total_vram_gb=16.0,
+            cuda_version="12.8",
+            device_index=1,
+        )
+
+        def fake_get_gpu_info(device: str | None = None) -> GPUInfo:
+            if device == "cuda:1":
+                return gpu_1
+            return GPUInfo(available=False)
+
+        with patch("caption_helper.tts.preflight.get_gpu_info", side_effect=fake_get_gpu_info):
+            result = check_tts_compatibility(MODEL_LOCAL_V15_4B, device="cuda:1")
+        assert result.ok is True
 
     def test_no_cuda(self) -> None:
         gpu = GPUInfo(available=False)

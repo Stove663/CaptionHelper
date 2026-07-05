@@ -6,6 +6,7 @@ export type Project = {
   error?: string | null;
   sync_mode?: string;
   tts_provider?: "moss-tts" | "glm-tts";
+  glm_phoneme_mode?: "auto" | "on" | "off";
 };
 
 export type CompressionRiskCue = {
@@ -17,6 +18,8 @@ export type CompressionRiskCue = {
   at_risk: boolean;
   cjk_chars: number;
   latin_chars: number;
+  code_mixed: boolean;
+  recommend_natural_pace: boolean;
 };
 
 export type TimelineData = {
@@ -77,11 +80,15 @@ export type SynthesisManifestCue = {
   reference_source?: string;
   reference_fallback_reason?: string;
   tokens?: number;
+  phoneme_enabled?: boolean;
+  text_prep_applied?: boolean;
+  glm_phoneme_mode?: string;
 };
 
 export type SynthesisManifest = {
   tts_provider?: "moss-tts" | "glm-tts";
   completed?: number;
+  fallback_count?: number;
   cues: SynthesisManifestCue[];
 };
 
@@ -90,6 +97,93 @@ export type RemuxStatus = {
   stage: string;
   error?: string | null;
 };
+
+export type RerunAction = "asr" | "references" | "synthesis" | "remux";
+
+const ASR_BUSY = new Set(["extracting", "transcribing", "splitting"]);
+const REFERENCES_BUSY = "building_references";
+
+export function isProjectProcessing(status: string): boolean {
+  return (
+    ASR_BUSY.has(status) ||
+    status === REFERENCES_BUSY ||
+    status === "synthesizing" ||
+    status === "remuxing"
+  );
+}
+
+export function availableRerunActions(status: string): RerunAction[] {
+  if (isProjectProcessing(status)) return [];
+
+  const actions: RerunAction[] = [];
+  const postAsr =
+    status === "ready" ||
+    status === "synthesis_ready" ||
+    status === "synthesis_failed" ||
+    status === "remux_ready" ||
+    status === "remux_failed" ||
+    status === "failed";
+
+  if (postAsr || status === "uploaded") {
+    actions.push("asr");
+  }
+  if (postAsr) {
+    actions.push("references");
+    actions.push("synthesis");
+  }
+  if (
+    status === "synthesis_ready" ||
+    status === "synthesis_failed" ||
+    status === "remux_ready" ||
+    status === "remux_failed"
+  ) {
+    actions.push("remux");
+  }
+  return actions;
+}
+
+async function postRerun(
+  id: string,
+  stage: RerunAction,
+  body?: Record<string, unknown>,
+): Promise<{ status: string }> {
+  const res = await fetch(`/api/projects/${id}/rerun/${stage}`, {
+    method: "POST",
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = err.detail;
+    if (typeof detail === "object" && detail?.message) {
+      throw new Error(detail.message);
+    }
+    throw new Error(typeof detail === "string" ? detail : "重跑失败");
+  }
+  return res.json();
+}
+
+export async function rerunAsr(id: string): Promise<{ status: string }> {
+  return postRerun(id, "asr");
+}
+
+export async function rerunReferences(id: string): Promise<{ status: string }> {
+  return postRerun(id, "references");
+}
+
+export async function rerunSynthesis(
+  id: string,
+  options?: { skipUnavailable?: boolean; syncMode?: string },
+): Promise<{ status: string; total?: number }> {
+  return postRerun(id, "synthesis", {
+    skip_unavailable: options?.skipUnavailable ?? false,
+    sync_mode: options?.syncMode,
+  });
+}
+
+export async function rerunRemux(id: string): Promise<{ status: string }> {
+  return postRerun(id, "remux");
+}
 
 export async function setSyncMode(id: string, syncMode: string): Promise<Project> {
   const res = await fetch(`/api/projects/${id}/sync-mode`, {
@@ -116,7 +210,12 @@ export async function setTtsProvider(
 
 export async function getCompressionRisk(
   id: string,
-): Promise<{ at_risk_count: number; cues: CompressionRiskCue[] }> {
+): Promise<{
+  at_risk_count: number;
+  code_mixed_modified_count: number;
+  provider_guidance: string | null;
+  cues: CompressionRiskCue[];
+}> {
   const res = await fetch(`/api/projects/${id}/compression-risk`);
   if (!res.ok) throw new Error("Failed to load compression risk");
   return res.json();
@@ -143,6 +242,15 @@ export async function listProjects(): Promise<Project[]> {
   return res.json();
 }
 
+export async function deleteProject(id: string): Promise<void> {
+  const res = await fetch(`/api/projects/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = err.detail;
+    throw new Error(typeof detail === "string" ? detail : "删除失败");
+  }
+}
+
 export async function getProject(id: string): Promise<Project> {
   const res = await fetch(`/api/projects/${id}`);
   if (!res.ok) throw new Error("Project not found");
@@ -153,7 +261,11 @@ export async function uploadVideo(file: File): Promise<Project> {
   const form = new FormData();
   form.append("file", file);
   const res = await fetch("/api/projects", { method: "POST", body: form });
-  if (!res.ok) throw new Error("Upload failed");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = err.detail;
+    throw new Error(typeof detail === "string" ? detail : "Upload failed");
+  }
   return res.json();
 }
 

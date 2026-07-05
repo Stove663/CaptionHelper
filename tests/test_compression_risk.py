@@ -29,6 +29,16 @@ class TestCompressionRisk:
         assert risk.cjk_chars > 0
         assert risk.latin_chars > 0
         assert risk.at_risk
+        assert risk.code_mixed
+        assert risk.recommend_natural_pace
+
+    def test_pure_chinese_at_risk_no_natural_pace_recommendation(self) -> None:
+        text = "这是一段非常非常长的中文替换文本需要更多时间才能说清楚"
+        cue = Cue(1, 0, 0, 500, "短", text, modified=True)
+        risk = assess_cue_compression(cue)
+        assert risk.at_risk
+        assert not risk.code_mixed
+        assert not risk.recommend_natural_pace
 
     def test_scan_returns_only_modified_at_risk(self) -> None:
         cues = [
